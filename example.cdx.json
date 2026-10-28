@@ -1,0 +1,6 @@
+{"bomFormat":"CycloneDX","specVersion":"1.5","components":[
+ {"name":"log4j-core","purl":"pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"},
+ {"name":"app","components":[{"name":"requests","purl":"pkg:pypi/requests@2.19.0"}]},
+ {"name":"lodash","purl":"pkg:npm/lodash@4.17.15"},
+ {"name":"flask","purl":"pkg:pypi/flask"}
+]}

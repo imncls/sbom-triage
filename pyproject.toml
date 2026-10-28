@@ -1,0 +1,6 @@
+# Settings for development tools only. sbom-triage has no build step and no dependencies:
+# it is distributed as the single file sbom_triage.py.
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
