@@ -1,6 +1,6 @@
 # sbom-triage
 
-Reads CycloneDX JSON SBOMs, looks up known vulnerabilities in their components in
+Reads CycloneDX and SPDX JSON SBOMs, looks up known vulnerabilities in their components in
 [OSV](https://osv.dev), and prioritizes them with the
 [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) catalog and
 [EPSS](https://www.first.org/epss/). Only needs Python 3.10+ (standard library).
@@ -54,7 +54,7 @@ python sbom_triage.py --input-dir /data/sboms --output-dir /data/vuln-reports
 
 With `sboms/app.cdx.json` and `sboms/api.json`, this writes
 `vuln-reports/app.cdx.triage.json` and `vuln-reports/api.triage.json`. Files in
-`sboms/` that are not CycloneDX JSON SBOMs are skipped with a warning.
+`sboms/` that are not CycloneDX or SPDX JSON SBOMs are skipped with a warning.
 
 Fail a CI job when there is anything HIGH or CRITICAL (exit code 3), keeping the
 report as a build artifact:
@@ -105,14 +105,14 @@ python /opt/sbom-triage/sbom_triage.py --input-dir /data/sboms --output-dir /dat
 read and symlinks are not followed). Each file is identified by its content (see
 [Supported input formats](#supported-input-formats)):
 
-- Files that are not CycloneDX JSON SBOMs are skipped with a warning. Only the first
-  few KB of a file are read to rule out non-JSON content, so large unrelated files
-  are not loaded.
-- A file that may be a CycloneDX SBOM but cannot be analyzed is an **error**: it
-  starts like one but is invalid (for example, it is still being written), it has an
-  unsupported `specVersion`, it cannot be read, or it does not fit in memory. The
-  other SBOMs are still analyzed and reported, and the script exits with code 4, so
-  the system that consumes the reports knows that one is missing.
+- Files that are not CycloneDX or SPDX JSON SBOMs are skipped with a warning. Only the
+  first few KB of a file are read to rule out non-JSON content, so large unrelated
+  files are not loaded.
+- A file that is or may be an SBOM but cannot be analyzed is an **error**: it starts
+  like one but is invalid (for example, it is still being written), it has an
+  unsupported version, it cannot be read, or it does not fit in memory. The other
+  SBOMs are still analyzed and reported, and the script exits with code 4, so the
+  system that consumes the reports knows that one is missing.
 
 There is no size limit for SBOMs.
 
@@ -136,7 +136,7 @@ in several SBOMs.
 | 1    | Error: invalid SBOM (single file), data source unavailable, unreadable or unwritable file |
 | 2    | Invalid arguments                                              |
 | 3    | `--fail-on`: there are findings with that priority or higher in any SBOM |
-| 4    | Directory mode: a CycloneDX SBOM could not be analyzed (see above). Takes precedence over 3 |
+| 4    | Directory mode: an SBOM could not be analyzed (see above). Takes precedence over 3 |
 
 `--fail-on` values: `critical`, `high`, `medium`, `no-data`, `low`.
 
@@ -166,21 +166,40 @@ has:
 | Input | Supported |
 |-------|-----------|
 | CycloneDX JSON, `specVersion` 1.x | Yes. Tested with real SBOMs in 1.2, 1.3, 1.4, and 1.5. |
-| CycloneDX JSON with a UTF-8 BOM | Yes |
+| SPDX 2.2 and 2.3 JSON | Yes. Tested with real SBOMs from Syft and Microsoft sbom-tool, and with the official SPDX examples. |
+| SPDX 3.0.x JSON-LD | Yes. Tested with the official SPDX 3.0.1 examples and with real SBOMs converted from SPDX 2.2 by the official SPDX tools. |
+| Any of the above with a UTF-8 BOM | Yes |
 | CycloneDX XML | No (skipped) |
 | CycloneDX Protocol Buffers | No (skipped) |
-| SPDX (JSON, tag-value, RDF, YAML) | No (skipped) |
+| SPDX tag-value, YAML, RDF/XML, Turtle | No (skipped) |
+| SPDX JSON of another version (2.1 or earlier, 3.1 or later) | No (error) |
 | Any other file | No (skipped) |
 
-A file is recognized by its content, not by its name or extension: it must be a JSON
-object with `"bomFormat": "CycloneDX"` and a `specVersion` of the form `1.x`. A file
-whose first bytes contain `"bomFormat": "CycloneDX"` (where CycloneDX tools write it)
-but that is not a valid SBOM is treated as a broken SBOM, not as an unrelated file.
+The format is recognized by the content of the file, not by its name or extension. It
+must be a JSON object with:
 
-Inside the SBOM, the script reads `components`, including nested ones. Each
-component needs a [purl](https://github.com/package-url/purl-spec) with a version
-(`pkg:npm/lodash@4.17.15`); if the purl has no version, the component's `version`
-field is used. Components without a purl or version are reported as not analyzed.
+- CycloneDX: `"bomFormat": "CycloneDX"` and a `specVersion` of the form `1.x`;
+- SPDX 2: `"spdxVersion": "SPDX-2.2"` or `"SPDX-2.3"`;
+- SPDX 3: an `@context` (a single value or a list) with the SPDX 3.0 context, such as
+  `https://spdx.org/rdf/3.0.1/spdx-context.jsonld`.
+
+A file whose first bytes look like an SBOM (`"bomFormat": "CycloneDX"`,
+`"spdxVersion"`, an SPDX 2 `"SPDXID"`, or the SPDX `@context`, which is where tools
+write them) but that is not a valid SBOM is treated as a broken SBOM, not as an
+unrelated file.
+
+Each component needs a [purl](https://github.com/package-url/purl-spec) with a
+version (`pkg:npm/lodash@4.17.15`); if the purl has no version, the version field of
+the component is used. Components without a purl or version are reported as not
+analyzed. The script reads:
+
+| Format | Components | purl | Version |
+|--------|------------|------|---------|
+| CycloneDX | `components`, including nested ones | `purl` | `version` |
+| SPDX 2 | `packages` | the first `externalRefs` entry with `referenceType` `purl` (`referenceLocator`) | `versionInfo` |
+| SPDX 3 | elements of `@graph` of type `software_Package`, `ai_AIPackage`, or `dataset_DatasetPackage` | `software_packageUrl`, or else an `externalIdentifier` of type `packageUrl` | `software_packageVersion` |
+
+Files and snippets have no purl and are not read.
 
 The purl types that OSV can look up are those of its ecosystems: `npm`, `pypi`,
 `maven`, `gradle`, `golang`, `cargo`, `nuget`, `gem`, `composer`, `pub`, `hex`,
@@ -300,6 +319,10 @@ python -m unittest
 ```
 
 The tests do not use the network.
+
+## How it was made
+
+This tool was developed with the help of AI coding assistants. Every change was tested, and the code of each release was reviewed by hand before it was published.
 
 ## Contributing
 

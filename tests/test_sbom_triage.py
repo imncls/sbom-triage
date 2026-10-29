@@ -7,6 +7,7 @@ import unittest.mock
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import ClassVar
 
 import sbom_triage as st
 
@@ -17,6 +18,39 @@ def package(purl: str, query_version: str | None = None) -> st.PackageRef:
 
 def cyclonedx(*components: dict) -> dict:
     return {"bomFormat": "CycloneDX", "specVersion": "1.5", "components": list(components)}
+
+
+SPDX3_CONTEXT = "https://spdx.org/rdf/3.0.1/spdx-context.jsonld"
+
+
+def spdx2(*packages: dict) -> dict:
+    return {"spdxVersion": "SPDX-2.3", "SPDXID": "SPDXRef-DOCUMENT", "packages": list(packages)}
+
+
+def spdx2_package(name: str, purl: str | None = None, **fields) -> dict:
+    refs = [{"referenceCategory": "PACKAGE-MANAGER", "referenceType": "purl", "referenceLocator": purl}] if purl else []
+    return {"name": name, "SPDXID": f"SPDXRef-{name}", "externalRefs": refs, **fields}
+
+
+def spdx3(*elements: dict) -> dict:
+    creation = {"type": "CreationInfo", "@id": "_:creationinfo", "specVersion": "3.0.1"}
+    return {"@context": SPDX3_CONTEXT, "@graph": [creation, *elements]}
+
+
+def spdx3_package(name: str, purl: str | None = None, **fields) -> dict:
+    package = {
+        "type": "software_Package",
+        "spdxId": f"urn:example:{name}",
+        "creationInfo": "_:creationinfo",
+        "name": name,
+    }
+    if purl:
+        package["software_packageUrl"] = purl
+    return {**package, **fields}
+
+
+def sbom(document: dict) -> st.Sbom:
+    return st.Sbom(st.sbom_format(document, "test.json"), document)
 
 
 class FakeResponse(io.BytesIO):
@@ -54,7 +88,7 @@ class SbomTests(unittest.TestCase):
 
     def test_extracts_nested_dedups_and_warns(self):
         with self.assertLogs("sbom_triage", "WARNING") as logs:
-            scan = st.extract_packages(self.BOM, "app.json")
+            scan = st.extract_packages(sbom(self.BOM), "app.json")
         packages = scan.packages
         self.assertEqual([p.label for p in packages], ["requests@2.0.0", "lodash@4.17.20", "django@3.2.0"])
         self.assertEqual(packages[2].query_version, "3.2.0")
@@ -65,6 +99,77 @@ class SbomTests(unittest.TestCase):
         self.assertIn("without a version", output)
         self.assertIn("pkg:pypi/flask", output)
 
+    def test_extracts_spdx2_packages(self):
+        document = spdx2(
+            spdx2_package("requests", "pkg:pypi/requests@2.0.0"),
+            {
+                "name": "lodash",
+                "externalRefs": [
+                    {"referenceCategory": "SECURITY", "referenceType": "cpe23Type", "referenceLocator": "cpe:2.3:a:x"},
+                    {
+                        "referenceCategory": "PACKAGE_MANAGER",
+                        "referenceType": "purl",
+                        "referenceLocator": "pkg:npm/lodash@4.17.20",
+                    },
+                ],
+            },
+            spdx2_package("django", "pkg:pypi/django", versionInfo="3.2.0"),
+            spdx2_package("noversion", "pkg:pypi/flask"),
+            spdx2_package("nopurl", versionInfo="1.0"),
+            {"SPDXID": "SPDXRef-unnamed"},
+            "not an object",
+            {"name": "bad-refs", "externalRefs": "not a list"},
+        )
+        with self.assertLogs("sbom_triage", "WARNING") as logs:
+            scan = st.extract_packages(sbom(document), "app.spdx.json")
+        self.assertEqual([p.label for p in scan.packages], ["requests@2.0.0", "lodash@4.17.20", "django@3.2.0"])
+        self.assertEqual(scan.packages[2].query_version, "3.2.0")
+        self.assertEqual(scan.skipped_components, 4)
+        output = "\n".join(logs.output)
+        self.assertIn("app.spdx.json: component without a purl: nopurl", output)
+        self.assertIn("component without a purl: SPDXRef-unnamed", output)
+        self.assertIn("without a version, skipped: pkg:pypi/flask", output)
+
+    def test_extracts_spdx3_packages(self):
+        document = spdx3(
+            spdx3_package("requests", "pkg:pypi/requests@2.0.0"),
+            spdx3_package(
+                "lodash",
+                externalIdentifier=[
+                    {"type": "ExternalIdentifier", "externalIdentifierType": "cpe23", "identifier": "cpe:2.3:a:x"},
+                    {
+                        "type": "ExternalIdentifier",
+                        "externalIdentifierType": "packageUrl",
+                        "identifier": "pkg:npm/lodash@4.17.20",
+                    },
+                ],
+            ),
+            spdx3_package("django", "pkg:pypi/django", software_packageVersion="3.2.0"),
+            {"type": "ai_AIPackage", "name": "model", "software_packageUrl": "pkg:huggingface/org/model@abc123"},
+            spdx3_package("noversion", "pkg:pypi/flask"),
+            spdx3_package("nopurl", software_packageVersion="1.0"),
+            {"type": "software_File", "name": "file", "software_packageUrl": "pkg:pypi/ignored@1.0"},
+            {"type": "Relationship", "from": "urn:example:requests", "to": ["urn:example:lodash"]},
+            "urn:example:only-a-reference",
+            {"type": ["software_Package"], "name": "unhashable-type", "software_packageUrl": "pkg:npm/x@1"},
+            {"type": {"@id": "software_Package"}, "name": "object-type", "software_packageUrl": "pkg:npm/y@1"},
+        )
+        with self.assertLogs("sbom_triage", "WARNING") as logs:
+            scan = st.extract_packages(sbom(document), "app.spdx3.json")
+        self.assertEqual(
+            [p.label for p in scan.packages], ["requests@2.0.0", "lodash@4.17.20", "django@3.2.0", "org/model@abc123"]
+        )
+        self.assertEqual(scan.packages[2].query_version, "3.2.0")
+        self.assertEqual(scan.skipped_components, 2)
+        output = "\n".join(logs.output)
+        self.assertIn("app.spdx3.json: component without a purl: nopurl", output)
+        self.assertIn("without a version, skipped: pkg:pypi/flask", output)
+
+    def test_spdx3_document_with_a_single_element(self):
+        document = {"@context": SPDX3_CONTEXT, **spdx3_package("requests", "pkg:pypi/requests@2.0.0")}
+        scan = st.extract_packages(sbom(document), "app.spdx3.json")
+        self.assertEqual([p.label for p in scan.packages], ["requests@2.0.0"])
+
     def test_osv_supported_purl_types(self):
         self.assertTrue(package("pkg:pub/http@1.0.0").osv_supported)
         self.assertTrue(package("pkg:deb/debian/openssl@1.1.1?distro=debian-11").osv_supported)
@@ -73,7 +178,9 @@ class SbomTests(unittest.TestCase):
 
     def test_coverage_reports_unsupported_types_without_results(self):
         supported, unknown, unknown_with_vulns = (
-            package("pkg:pypi/a@1"), package("pkg:unknowntype/b@1"), package("pkg:unknowntype/c@1"),
+            package("pkg:pypi/a@1"),
+            package("pkg:unknowntype/b@1"),
+            package("pkg:unknowntype/c@1"),
         )
         scan = st.SbomScan("app.json", [supported, unknown, unknown_with_vulns], skipped_components=4)
         found = {supported: {}, unknown: {}, unknown_with_vulns: {"X-1": ""}}
@@ -100,15 +207,37 @@ class ReadSbomTests(unittest.TestCase):
 
     def test_accepts_cyclonedx_json(self):
         path = self.write("a.json", json.dumps(cyclonedx()).encode())
-        self.assertEqual(st.read_sbom(path)["bomFormat"], "CycloneDX")
+        self.assertEqual(st.read_sbom(path), st.Sbom(st.FORMAT_CYCLONEDX, cyclonedx()))
+
+    def test_accepts_spdx_json(self):
+        cases = {
+            "spdx2.json": (spdx2(), st.FORMAT_SPDX2),
+            "spdx22.json": ({**spdx2(), "spdxVersion": "SPDX-2.2"}, st.FORMAT_SPDX2),
+            "spdx3.json": (spdx3(), st.FORMAT_SPDX3),
+            "spdx300.json": (
+                {**spdx3(), "@context": "https://spdx.org/rdf/3.0.0/spdx-context.jsonld"},
+                st.FORMAT_SPDX3,
+            ),
+            "spdx3-list.json": (
+                {**spdx3(), "@context": [SPDX3_CONTEXT, {"ex": "https://example.com/"}]},
+                st.FORMAT_SPDX3,
+            ),
+        }
+        for name, (document, sbom_format) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(st.read_sbom(self.write(name, json.dumps(document).encode())).format, sbom_format)
 
     def test_accepts_utf8_bom_and_leading_whitespace(self):
-        path = self.write("a.json", b"\xef\xbb\xbf \n" + json.dumps(cyclonedx()).encode())
-        self.assertEqual(st.read_sbom(path)["specVersion"], "1.5")
+        for document in (cyclonedx(), spdx2(), spdx3()):
+            path = self.write("a.json", b"\xef\xbb\xbf \n" + json.dumps(document).encode())
+            self.assertEqual(st.read_sbom(path).document, document)
 
-    def test_rejects_files_that_are_not_cyclonedx(self):
+    def test_rejects_files_that_are_not_sboms(self):
         cases = {
-            "spdx.json": json.dumps({"spdxVersion": "SPDX-2.3", "SPDXID": "SPDXRef-DOCUMENT"}).encode(),
+            "spdx.spdx": b"SPDXVersion: SPDX-2.3\nDataLicense: CC0-1.0\nSPDXID: SPDXRef-DOCUMENT\n",
+            "spdx.yaml": b'spdxVersion: "SPDX-2.3"\nSPDXID: "SPDXRef-DOCUMENT"\n',
+            "spdx3.yaml": b'"@context": "https://spdx.org/rdf/3.0.1/spdx-context.jsonld"\n"@graph": []\n',
+            "jsonld.json": json.dumps({"@context": "https://schema.org/", "@type": "Person"}).encode(),
             "bom.xml": b'<?xml version="1.0"?><bom xmlns="http://cyclonedx.org/schema/bom/1.5"/>',
             "other.json": json.dumps({"name": "not an sbom"}).encode(),
             "array.json": b"[1, 2, 3]",
@@ -120,13 +249,35 @@ class ReadSbomTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(st.NotAnSbomError):
                 st.read_sbom(self.write(name, content))
 
-    def test_cyclonedx_files_that_cannot_be_analyzed_are_errors(self):
-        full = json.dumps(cyclonedx({"name": "x", "purl": "pkg:npm/x@1.0.0"}))
+    def test_sboms_that_cannot_be_analyzed_are_errors(self):
         cases = {
-            "half-written.json": full[: len(full) // 2].encode(),
-            "future.json": json.dumps({"bomFormat": "CycloneDX", "specVersion": "2.0"}).encode(),
-            "nospec.json": json.dumps({"bomFormat": "CycloneDX"}).encode(),
+            "future.json": {"bomFormat": "CycloneDX", "specVersion": "2.0"},
+            "nospec.json": {"bomFormat": "CycloneDX"},
+            "spdx21.json": {**spdx2(), "spdxVersion": "SPDX-2.1"},
+            "spdx24.json": {**spdx2(), "spdxVersion": "SPDX-2.4"},
+            "spdx30-as-2.json": {**spdx2(), "spdxVersion": "SPDX-3.0"},
+            "spdx-version-not-text.json": {**spdx2(), "spdxVersion": 2.3},
+            "spdx31.json": {**spdx3(), "@context": "https://spdx.org/rdf/3.1/spdx-context.jsonld"},
+            "spdx3-other-file.json": {**spdx3(), "@context": "https://spdx.org/rdf/3.0.1/other.jsonld"},
         }
+        for name, document in cases.items():
+            with self.subTest(name=name), self.assertRaises(st.SbomError) as raised:
+                st.read_sbom(self.write(name, json.dumps(document).encode()))
+            self.assertNotIsInstance(raised.exception, st.NotAnSbomError)
+
+    def test_sboms_that_are_not_valid_json_are_errors(self):
+        cases = {}
+        for prefix, document in (
+            ("cyclonedx", cyclonedx({"name": "x", "purl": "pkg:npm/x@1.0.0"})),
+            ("spdx2", spdx2(spdx2_package("x", "pkg:npm/x@1.0.0"))),
+            ("spdx3", spdx3(spdx3_package("x", "pkg:npm/x@1.0.0"))),
+            ("spdx3-list", {**spdx3(spdx3_package("x", "pkg:npm/x@1.0.0")), "@context": [SPDX3_CONTEXT]}),
+        ):
+            full = json.dumps(document)
+            cases[f"{prefix}-half-written.json"] = full[: len(full) // 2].encode()
+        # Microsoft sbom-tool writes the files first and spdxVersion at the end.
+        files_first = {"files": [{"fileName": "./a.dll", "SPDXID": "SPDXRef-File--a.dll"}], **spdx2()}
+        cases["spdx2-files-first-half-written.json"] = json.dumps(files_first)[:60].encode()
         for name, content in cases.items():
             with self.subTest(name=name), self.assertRaises(st.SbomError) as raised:
                 st.read_sbom(self.write(name, content))
@@ -140,18 +291,23 @@ class ReadSbomTests(unittest.TestCase):
     def test_load_directory_skips_non_sboms_and_subdirectories(self):
         self.write("a.cdx.json", json.dumps(cyclonedx({"name": "x", "purl": "pkg:pypi/x@1"})).encode())
         self.write("b.json", json.dumps(cyclonedx({"name": "y", "purl": "pkg:npm/y@2"})).encode())
-        self.write("spdx.json", json.dumps({"spdxVersion": "SPDX-2.3"}).encode())
+        self.write("c.spdx.json", json.dumps(spdx2(spdx2_package("z", "pkg:npm/z@3"))).encode())
+        self.write("d.spdx3.json", json.dumps(spdx3(spdx3_package("w", "pkg:npm/w@4"))).encode())
+        self.write("other.json", json.dumps({"name": "not an sbom"}).encode())
         self.write("notes.txt", b"hello")
         self.write("partial.json", b'{"bomFormat": "CycloneDX", "specVersion": "1.5", "compo')
+        self.write("partial-spdx3.json", b'{"@context": "https://spdx.org/rdf/3.0.1/spdx-context.jsonld", "@gra')
         (self.dir / "sub").mkdir()
         (self.dir / "sub" / "c.json").write_text(json.dumps(cyclonedx()), encoding="utf-8")
         with self.assertLogs("sbom_triage", "INFO") as logs:
             inputs = st.load_directory(self.dir)
-        self.assertEqual([scan.source for scan in inputs.scans], ["a.cdx.json", "b.json"])
+        self.assertEqual(
+            [scan.source for scan in inputs.scans], ["a.cdx.json", "b.json", "c.spdx.json", "d.spdx3.json"]
+        )
         self.assertEqual(inputs.skipped_files, 2)
-        self.assertEqual(inputs.failed_files, ("partial.json",))
+        self.assertEqual(inputs.failed_files, ("partial-spdx3.json", "partial.json"))
         output = "\n".join(logs.output)
-        self.assertIn("spdx.json is not a CycloneDX SBOM", output)
+        self.assertIn("other.json is not a CycloneDX or SPDX SBOM", output)
         self.assertIn("ERROR:sbom_triage:cannot analyze: partial.json is not valid JSON", output)
 
     def test_load_directory_requires_a_directory(self):
@@ -228,7 +384,9 @@ class CvssTests(unittest.TestCase):
 
     def test_v4_only_record_gets_a_numeric_score(self):
         data = {
-            "severity": [{"type": "CVSS_V4", "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"}],
+            "severity": [
+                {"type": "CVSS_V4", "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"}
+            ],
             "database_specific": {"severity": "MODERATE"},
         }
         info = st.cvss_info(data, package("pkg:pypi/a@1"))
@@ -237,7 +395,7 @@ class CvssTests(unittest.TestCase):
 
 
 class OsvDataTests(unittest.TestCase):
-    DATA = {
+    DATA: ClassVar[dict] = {
         "id": "GHSA-xxxx-yyyy-zzzz",
         "aliases": ["CVE-2021-44228", "OTHER-1"],
         "summary": "Remote code\x1b[31m execution",
@@ -335,16 +493,20 @@ class PriorityTests(unittest.TestCase):
 
 class DuplicateTests(unittest.TestCase):
     PKG = package("pkg:pypi/requests@2.19.0")
-    DETAILS = {
+    DETAILS: ClassVar[dict] = {
         "GHSA-x84v-xcm2-53pg": {
             "aliases": ["CVE-2018-18074", "PYSEC-2018-28"],
             "summary": "Insufficiently Protected Credentials",
             "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"}],
-            "affected": [{"package": {"name": "requests"}, "ranges": [{"type": "ECOSYSTEM", "events": [{"fixed": "2.20.0"}]}]}],
+            "affected": [
+                {"package": {"name": "requests"}, "ranges": [{"type": "ECOSYSTEM", "events": [{"fixed": "2.20.0"}]}]}
+            ],
         },
         "PYSEC-2018-28": {
             "aliases": ["CVE-2018-18074", "GHSA-x84v-xcm2-53pg"],
-            "affected": [{"package": {"name": "requests"}, "ranges": [{"type": "ECOSYSTEM", "events": [{"fixed": "2.20"}]}]}],
+            "affected": [
+                {"package": {"name": "requests"}, "ranges": [{"type": "ECOSYSTEM", "events": [{"fixed": "2.20"}]}]}
+            ],
         },
         # Only shares a CVE with the others, no direct aliases.
         "OTHER-1": {"upstream": ["CVE-2018-18074"]},
@@ -482,19 +644,21 @@ class OsvQueryTests(unittest.TestCase):
 
     def test_splits_batches_of_1000(self):
         packages = [package(f"pkg:pypi/p{i}@1.0") for i in range(1001)]
-        client = FakeClient(
-            {st.OSV_QUERYBATCH_URL: lambda url, payload: {"results": [{} for _ in payload["queries"]]}}
-        )
+        client = FakeClient({st.OSV_QUERYBATCH_URL: lambda url, payload: {"results": [{} for _ in payload["queries"]]}})
         st.query_osv(client, packages)
         self.assertEqual([len(c[2]["queries"]) for c in client.calls], [1000, 1])
 
     def test_ids_with_colon_are_kept_and_cached_under_safe_name(self):
         vuln_id = "openSUSE-SU-2024:0001-1"
         pkg = package("pkg:rpm/opensuse/opera@1.0")
-        client = FakeClient({
-            st.OSV_QUERYBATCH_URL: lambda url, payload: {"results": [{"vulns": [{"id": vuln_id, "modified": "m"}]}]},
-            "https://api.osv.dev/v1/vulns/": lambda url, payload: {"id": vuln_id, "modified": "m"},
-        })
+        client = FakeClient(
+            {
+                st.OSV_QUERYBATCH_URL: lambda url, payload: {
+                    "results": [{"vulns": [{"id": vuln_id, "modified": "m"}]}]
+                },
+                "https://api.osv.dev/v1/vulns/": lambda url, payload: {"id": vuln_id, "modified": "m"},
+            }
+        )
         self.assertEqual(st.query_osv(client, [pkg])[pkg], {vuln_id: "m"})
         with tempfile.TemporaryDirectory() as tmp:
             cache = st.DiskCache(Path(tmp))
@@ -539,9 +703,11 @@ class OsvQueryTests(unittest.TestCase):
 
 
 class KevEpssTests(unittest.TestCase):
-    KEV = {"vulnerabilities": [
-        {"cveID": "CVE-2021-44228", "dateAdded": "2021-12-10", "knownRansomwareCampaignUse": "Known"},
-    ]}
+    KEV: ClassVar[dict] = {
+        "vulnerabilities": [
+            {"cveID": "CVE-2021-44228", "dateAdded": "2021-12-10", "knownRansomwareCampaignUse": "Known"},
+        ]
+    }
 
     def test_kev_is_downloaded_every_time(self):
         client = FakeClient({st.KEV_URL: lambda url, payload: self.KEV})
@@ -578,10 +744,12 @@ LOG4J_DETAIL = {
     "modified": "m",
     "aliases": ["CVE-2021-44228"],
     "summary": "Log4Shell",
-    "affected": [{
-        "package": {"ecosystem": "Maven", "name": "org.apache.logging.log4j:log4j-core"},
-        "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "2.0"}, {"fixed": "2.15.0"}]}],
-    }],
+    "affected": [
+        {
+            "package": {"ecosystem": "Maven", "name": "org.apache.logging.log4j:log4j-core"},
+            "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "2.0"}, {"fixed": "2.15.0"}]}],
+        }
+    ],
 }
 
 
@@ -589,17 +757,25 @@ def log4j_client() -> FakeClient:
     """OSV reports Log4Shell for log4j-core 2.14.1 and nothing for any other package."""
 
     def querybatch(url, payload):
-        return {"results": [
-            {"vulns": [{"id": "GHSA-jfh8-c2jp-5v3q", "modified": "m"}]} if q["package"]["purl"] == LOG4J_PURL else {}
-            for q in payload["queries"]
-        ]}
+        return {
+            "results": [
+                {"vulns": [{"id": "GHSA-jfh8-c2jp-5v3q", "modified": "m"}]}
+                if q["package"]["purl"] == LOG4J_PURL
+                else {}
+                for q in payload["queries"]
+            ]
+        }
 
-    return FakeClient({
-        st.OSV_QUERYBATCH_URL: querybatch,
-        "https://api.osv.dev/v1/vulns/": lambda url, payload: LOG4J_DETAIL,
-        st.KEV_URL: lambda url, payload: KevEpssTests.KEV,
-        st.EPSS_URL: lambda url, payload: {"data": [{"cve": "CVE-2021-44228", "epss": "0.97", "percentile": "0.999"}]},
-    })
+    return FakeClient(
+        {
+            st.OSV_QUERYBATCH_URL: querybatch,
+            "https://api.osv.dev/v1/vulns/": lambda url, payload: LOG4J_DETAIL,
+            st.KEV_URL: lambda url, payload: KevEpssTests.KEV,
+            st.EPSS_URL: lambda url, payload: {
+                "data": [{"cve": "CVE-2021-44228", "epss": "0.97", "percentile": "0.999"}]
+            },
+        }
+    )
 
 
 class EndToEndTests(unittest.TestCase):
@@ -611,16 +787,28 @@ class EndToEndTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_quietly(self, args, client):
-        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, self.assertLogs("sbom_triage", "INFO"):
+        with (
+            unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            self.assertLogs("sbom_triage", "INFO"),
+        ):
             code = st.run(args, client)
         return code, stdout.getvalue()
 
     def test_single_sbom_with_json_and_fail_on(self):
-        (self.dir / "bom.json").write_text(json.dumps(cyclonedx({"name": "log4j", "purl": LOG4J_PURL})), encoding="utf-8")
-        args = st.parse_args([
-            str(self.dir / "bom.json"), "--json", str(self.dir / "out.json"),
-            "--cache-dir", str(self.dir / "cache"), "--fail-on", "high",
-        ])
+        (self.dir / "bom.json").write_text(
+            json.dumps(cyclonedx({"name": "log4j", "purl": LOG4J_PURL})), encoding="utf-8"
+        )
+        args = st.parse_args(
+            [
+                str(self.dir / "bom.json"),
+                "--json",
+                str(self.dir / "out.json"),
+                "--cache-dir",
+                str(self.dir / "cache"),
+                "--fail-on",
+                "high",
+            ]
+        )
         code, output = self.run_quietly(args, log4j_client())
         self.assertEqual(code, st.EXIT_FAIL_ON)
         self.assertIn("CRITICAL", output)
@@ -641,37 +829,77 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(self.run_quietly(no_threshold, log4j_client())[0], 0)
 
     def test_invalid_single_sbom_is_an_error(self):
-        (self.dir / "spdx.json").write_text(json.dumps({"spdxVersion": "SPDX-2.3"}), encoding="utf-8")
-        args = st.parse_args([str(self.dir / "spdx.json"), "--cache-dir", str(self.dir / "cache")])
+        (self.dir / "other.json").write_text(json.dumps({"name": "not an sbom"}), encoding="utf-8")
+        args = st.parse_args([str(self.dir / "other.json"), "--cache-dir", str(self.dir / "cache")])
         with self.assertRaises(st.SbomError):
             st.run(args, log4j_client())
+
+    def test_same_findings_in_every_sbom_format(self):
+        sboms = self.dir / "in"
+        sboms.mkdir()
+        documents = {
+            "app.cdx.json": cyclonedx({"name": "log4j-core", "purl": LOG4J_PURL}),
+            "app.spdx.json": spdx2(spdx2_package("log4j-core", LOG4J_PURL)),
+            "app.spdx3.json": spdx3(spdx3_package("log4j-core", LOG4J_PURL)),
+        }
+        for name, document in documents.items():
+            (sboms / name).write_text(json.dumps(document), encoding="utf-8")
+        out = self.dir / "out"
+        args = st.parse_args(
+            ["--input-dir", str(sboms), "--output-dir", str(out), "--cache-dir", str(self.dir / "cache")]
+        )
+        code, output = self.run_quietly(args, log4j_client())
+        self.assertEqual(code, 0)
+        reports = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(out.iterdir())]
+        self.assertEqual([report["sbom"] for report in reports], sorted(documents))
+        for report in reports:
+            self.assertEqual(report["coverage"], reports[0]["coverage"])
+            self.assertEqual(report["findings"], reports[0]["findings"])
+        self.assertEqual([f["id"] for f in reports[0]["findings"]], ["GHSA-jfh8-c2jp-5v3q"])
+        self.assertIn("SBOMs analyzed: 3. Files skipped (not a CycloneDX or SPDX JSON SBOM): 0.", output)
 
     def test_directory_mode(self):
         sboms = self.dir / "in"
         sboms.mkdir()
         shared = {"name": "shared", "purl": "pkg:pypi/requests@2.0.0"}
-        (sboms / "one.cdx.json").write_text(json.dumps(cyclonedx({"name": "log4j", "purl": LOG4J_PURL}, shared)), encoding="utf-8")
+        (sboms / "one.cdx.json").write_text(
+            json.dumps(cyclonedx({"name": "log4j", "purl": LOG4J_PURL}, shared)), encoding="utf-8"
+        )
         (sboms / "two.json").write_text(json.dumps(cyclonedx(shared)), encoding="utf-8")
-        (sboms / "spdx.json").write_text(json.dumps({"spdxVersion": "SPDX-2.3"}), encoding="utf-8")
+        (sboms / "other.json").write_text(json.dumps({"name": "not an sbom"}), encoding="utf-8")
         out = self.dir / "out"
         client = log4j_client()
-        args = st.parse_args([
-            "--input-dir", str(sboms), "--output-dir", str(out),
-            "--cache-dir", str(self.dir / "cache"), "--fail-on", "critical",
-        ])
+        args = st.parse_args(
+            [
+                "--input-dir",
+                str(sboms),
+                "--output-dir",
+                str(out),
+                "--cache-dir",
+                str(self.dir / "cache"),
+                "--fail-on",
+                "critical",
+            ]
+        )
         code, output = self.run_quietly(args, client)
 
         self.assertEqual(code, st.EXIT_FAIL_ON)
         # One query round for both SBOMs, with the shared package only once.
         [querybatch] = [call for call in client.calls if call[1] == st.OSV_QUERYBATCH_URL]
-        self.assertEqual(sorted(q["package"]["purl"] for q in querybatch[2]["queries"]), sorted([LOG4J_PURL, shared["purl"]]))
+        self.assertEqual(
+            sorted(q["package"]["purl"] for q in querybatch[2]["queries"]), sorted([LOG4J_PURL, shared["purl"]])
+        )
         self.assertEqual(sorted(p.name for p in out.iterdir()), ["one.cdx.triage.json", "two.triage.json"])
         one = json.loads((out / "one.cdx.triage.json").read_text(encoding="utf-8"))
         two = json.loads((out / "two.triage.json").read_text(encoding="utf-8"))
         self.assertEqual([f["id"] for f in one["findings"]], ["GHSA-jfh8-c2jp-5v3q"])
         self.assertEqual(two["findings"], [])
         self.assertIn("== one.cdx.json ==", output)
-        self.assertIn("SBOMs analyzed: 2. Files skipped (not a CycloneDX JSON SBOM): 1. SBOMs that could not be analyzed: 0.", output)
+        self.assertIn(
+            "SBOMs analyzed: 2. Files skipped (not a CycloneDX or SPDX JSON SBOM): 1."
+            " SBOMs that could not be analyzed: 0.",
+            output,
+        )
 
     def test_broken_sbom_in_directory_takes_precedence_over_fail_on(self):
         sboms = self.dir / "in"
@@ -679,10 +907,18 @@ class EndToEndTests(unittest.TestCase):
         (sboms / "ok.json").write_text(json.dumps(cyclonedx({"name": "log4j", "purl": LOG4J_PURL})), encoding="utf-8")
         (sboms / "partial.json").write_bytes(b'{"bomFormat": "CycloneDX", "specVersion": "1.5", "comp')
         out = self.dir / "out"
-        args = st.parse_args([
-            "--input-dir", str(sboms), "--output-dir", str(out),
-            "--cache-dir", str(self.dir / "cache"), "--fail-on", "critical",
-        ])
+        args = st.parse_args(
+            [
+                "--input-dir",
+                str(sboms),
+                "--output-dir",
+                str(out),
+                "--cache-dir",
+                str(self.dir / "cache"),
+                "--fail-on",
+                "critical",
+            ]
+        )
         code, output = self.run_quietly(args, log4j_client())
         self.assertEqual(code, st.EXIT_SBOM_FAILED)
         # The SBOMs that could be read are still analyzed and reported.

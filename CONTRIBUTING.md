@@ -81,8 +81,8 @@ Python.
   file name, and only follow redirects to HTTPS.
 - The tool only generates results. It does not store them or compare runs.
 - If a data source fails, fail with a clear message; never fall back to stored data.
-  In directory mode, a file that may be a CycloneDX SBOM but cannot be analyzed is an
-  error (exit code 4), not a skipped file.
+  In directory mode, a file that is or may be a CycloneDX or SPDX SBOM but cannot be
+  analyzed is an error (exit code 4), not a skipped file.
 - Scoring code must cite its source (see [CVSS scoring](#cvss-scoring)).
 
 ## Before opening a pull request
@@ -116,8 +116,8 @@ Tests must not use the network. Network code is tested by injecting:
 - a `FakeClient` (in the test file) that answers by URL prefix and records the
   requests, for OSV, KEV, EPSS, and end-to-end runs.
 
-SBOMs and API responses are small and built inside the tests (see `cyclonedx()` and
-`log4j_client()` in the test file).
+SBOMs and API responses are small and built inside the tests (see `cyclonedx()`,
+`spdx2()`, `spdx3()`, and `log4j_client()` in the test file).
 
 ## CVSS scoring
 
@@ -160,17 +160,44 @@ changes:
 
 - [CycloneDX/bom-examples](https://github.com/CycloneDX/bom-examples), folder
   `SBOM/` (CC0): CycloneDX JSON and XML in several spec versions.
-- [chainguard-dev/bom-shelter](https://github.com/chainguard-dev/bom-shelter), folder
-  `in-the-wild/`: CycloneDX and SPDX SBOMs from open source projects. On Windows,
-  git cannot check out this repository because other folders contain file names
-  with `:`; download only `in-the-wild/` (for example through the GitHub API and
-  `raw.githubusercontent.com`).
+- [chainguard-sandbox/bom-shelter](https://github.com/chainguard-sandbox/bom-shelter),
+  folder `in-the-wild/`: CycloneDX and SPDX SBOMs from open source projects,
+  including SPDX 2.2 and 2.3 JSON from Syft and Microsoft sbom-tool, and SPDX
+  tag-value and CycloneDX XML files that must be skipped. On Windows, git cannot
+  check out this repository because other folders contain file names with `:`;
+  download only `in-the-wild/` (for example through the GitHub API and
+  `raw.githubusercontent.com`). `spdx/powershell-2.2.6.spdx.json` is broken in the
+  collection (text from a web page follows the JSON), so it must be reported as an
+  SBOM that could not be analyzed.
+- [spdx/spdx-examples](https://github.com/spdx/spdx-examples) (GPL-3.0): SPDX 2.2
+  and 2.3 JSON and SPDX 3.0.1 JSON-LD, many of them the same SBOM in both versions
+  (`software/exampleN/spdx2.x/` and `software/exampleN/spdx3.0/`), and tag-value
+  files that must be skipped.
+- [spdx/spdx-spec](https://github.com/spdx/spdx-spec), folder `examples/jsonld/` of
+  the `develop` branch: the official SPDX 3.0.1 examples.
+
+Few tools generate SPDX 3.0.1 yet. To test larger SPDX 3 files from real tools,
+convert the SPDX 2 JSON files of bom-shelter with the official converter,
+[spdx/tools-java](https://github.com/spdx/tools-java) (Apache-2.0; tested with
+version 2.0.7 on a Temurin 21 Java runtime). Check the jar against the checksum
+published in Maven Central before running it:
+
+```
+java -DSPDXParser.OnlyUseLocalLicenses=true -jar tools-java-<version>-jar-with-dependencies.jar Convert <in>.spdx.json <out>.spdx3.jsonld JSON JSONLD
+```
+
+Only files that follow the SPDX 2 specification convert: with tools-java 2.0.7,
+`julia.spdx.json` and the three Microsoft sbom-tool files. The 2022 Syft files are
+rejected (duplicate or invalid SPDX IDs, timestamps with fractional seconds). Each
+converted file must give the same findings and coverage as its SPDX 2 original.
 
 Treat downloaded SBOMs as untrusted data: keep them in their own directory, outside
 the repository.
 
 Copy all files into one flat directory (the script does not read subdirectories)
-and run:
+and run the command below. spdx-examples repeats file names in different folders, so
+derive the names from the path (`software/example9/spdx3.0/appbomination.spdx3.json`
+→ `software__example9__spdx3.0__appbomination.spdx3.json`).
 
 ```
 python sbom_triage.py --input-dir <flat dir> --output-dir <reports dir>
@@ -179,14 +206,27 @@ python sbom_triage.py --input-dir <flat dir> --output-dir <reports dir>
 Then check that:
 
 - there are no tracebacks or unexpected errors;
-- every skipped file is really not a CycloneDX JSON SBOM;
-- the same SBOM in different spec versions (bom-examples has several) gives the same
-  findings;
+- every skipped file is really not a CycloneDX or SPDX JSON SBOM, and every SBOM that
+  could not be analyzed is really broken or of an unsupported version;
+- the same SBOM in different spec versions gives the same findings: bom-examples has
+  several CycloneDX versions, and spdx-examples has pairs of SPDX 2.x and 3.0.1. The
+  coverage may only differ where the examples describe something differently (in
+  `example7`, the 3.0.1 version describes the binary as a file, not a package);
+- the coverage matches an independent count: for each SBOM, `analyzed_packages` plus
+  `uncovered_purls` equals the number of distinct purls with a version (tools such as
+  Syft list the same package several times), and components without a purl, with an
+  invalid purl, or without a version are counted in `skipped_components`;
 - the findings match the sources. For each package, the IDs in `id` and
   `related_ids` must be exactly what `POST https://api.osv.dev/v1/query` returns for
-  its purl; KEV and EPSS values must match the KEV catalog and the EPSS API; scores
-  must match the FIRST calculators; and the priority must follow the rules in the
-  README. Run the check right after the script, so both use the same data.
+  its purl; KEV and EPSS values must match the KEV catalog and the EPSS API (a
+  finding with several CVEs shows the highest EPSS of them); scores must match the
+  FIRST calculators; and the priority must follow the rules in the README. Run the
+  check right after the script, so both use the same data.
+
+After a change to how SBOMs are read, also run the previous release
+(`git show <tag>:sbom_triage.py`) and the new version on the same files, one right
+after the other: the findings and coverage of the formats that did not change must
+be identical.
 
 ## Data source assumptions
 

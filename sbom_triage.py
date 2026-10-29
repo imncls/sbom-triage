@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Looks up known vulnerabilities in the components of CycloneDX JSON SBOMs.
+"""Looks up known vulnerabilities in the components of CycloneDX and SPDX JSON SBOMs.
 
 Queries OSV by purl, enriches each vulnerability with CISA KEV and EPSS, and
 assigns it a priority. Reads a single SBOM or every SBOM in a directory. Uses
@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 TOOL_NAME = "sbom-triage"
 PROJECT_URL = "https://github.com/imncls/sbom-triage"
 # Version of the JSON report format. Increase it on any incompatible change.
@@ -61,9 +61,24 @@ MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 SNIFF_BYTES = 4096
 UTF8_BOM = b"\xef\xbb\xbf"
 SPEC_VERSION_RE = re.compile(r"^1\.\d+$")
-# CycloneDX tools write bomFormat at the start of the document, so a file whose first
-# bytes contain it is a CycloneDX SBOM even if it cannot be parsed (e.g. half written).
-CYCLONEDX_MARKER_RE = re.compile(rb'"bomFormat"\s*:\s*"CycloneDX"')
+# SPDX 2.2 introduced the JSON format; 2.3 uses the same schema.
+SPDX2_VERSION_RE = re.compile(r"^SPDX-2\.[23]$")
+SPDX_CONTEXT_PREFIX = "https://spdx.org/rdf/"
+SPDX3_CONTEXT_RE = re.compile(r"^https://spdx\.org/rdf/3\.0\.\d+/spdx-context\.jsonld$")
+# software_Package and its subclasses in the AI and Dataset profiles.
+SPDX3_PACKAGE_TYPES = frozenset({"software_Package", "ai_AIPackage", "dataset_DatasetPackage"})
+# Tools write bomFormat (CycloneDX) or @context (SPDX 3) at the start of the document, so a
+# file whose first bytes contain one is an SBOM even if it cannot be parsed (e.g. half
+# written). SPDX 2 tools do not always start with spdxVersion (Microsoft sbom-tool writes it
+# last), but every SPDX 2 element has an SPDXID, and the document starts with elements or
+# with its own SPDXID.
+SBOM_MARKER_RE = re.compile(
+    rb'"bomFormat"\s*:\s*"CycloneDX"|"spdxVersion"\s*:\s*"SPDX-|"SPDXID"\s*:\s*"SPDXRef-'
+    rb'|"@context"\s*:\s*\[?\s*"https://spdx\.org/rdf/'
+)
+FORMAT_CYCLONEDX = "CycloneDX"
+FORMAT_SPDX2 = "SPDX 2"
+FORMAT_SPDX3 = "SPDX 3"
 OUTPUT_SUFFIX = ".triage.json"
 
 # IDs come from an external API. Some contain ":" (e.g. openSUSE-SU-2024:0001-1);
@@ -86,9 +101,7 @@ OSV_PURL_TYPES = frozenset(
 OSV_DISTRO_NAMESPACES = {
     "apk": frozenset({"alpaquita", "alpine", "bellsoft-hardened-containers", "chainguard", "minimos", "wolfi"}),
     "deb": frozenset({"debian", "echo", "ubuntu"}),
-    "rpm": frozenset(
-        {"almalinux", "azure-linux", "mageia", "openeuler", "opensuse", "redhat", "rocky-linux", "suse"}
-    ),
+    "rpm": frozenset({"almalinux", "azure-linux", "mageia", "openeuler", "opensuse", "redhat", "rocky-linux", "suse"}),
 }
 
 # CWE-506 (Embedded Malicious Code) marks GHSA malware advisories; OSV uses MAL- IDs.
@@ -128,7 +141,7 @@ class SbomError(Exception):
 
 
 class NotAnSbomError(SbomError):
-    """The file is readable but is not a CycloneDX JSON SBOM."""
+    """The file is readable but is not a CycloneDX or SPDX JSON SBOM."""
 
 
 class ApiError(Exception):
@@ -213,40 +226,69 @@ class PackageRef:
         return _normalize_name(ecosystem_name) in {_normalize_name(c) for c in candidates}
 
 
-def read_sbom(path: Path) -> dict[str, Any]:
-    """Loads a file and checks from its content that it is a CycloneDX JSON SBOM.
+@dataclass(frozen=True)
+class Sbom:
+    format: str
+    document: dict[str, Any]
 
-    Raises NotAnSbomError for files that are not CycloneDX JSON, and SbomError for files
-    that cannot be analyzed although they may be SBOMs: unreadable, too large for memory,
-    or starting like a CycloneDX SBOM but invalid (e.g. still being written). There is no
-    size limit.
+
+def read_sbom(path: Path) -> Sbom:
+    """Loads a file and identifies from its content whether it is a CycloneDX or SPDX JSON SBOM.
+
+    Raises NotAnSbomError for files that are not, and SbomError for files that cannot be
+    analyzed although they are or may be SBOMs: unreadable, too large for memory, starting
+    like an SBOM but invalid (e.g. still being written), or of an unsupported version.
+    There is no size limit.
     """
     name = clean(path.name)
-    looks_like_cyclonedx = False
+    looks_like_sbom = False
     try:
         with path.open("rb") as handle:
             head = handle.read(SNIFF_BYTES)
-            looks_like_cyclonedx = CYCLONEDX_MARKER_RE.search(head) is not None
+            # Other formats may contain the same markers (e.g. SPDX YAML with quoted keys).
             if not head.removeprefix(UTF8_BOM).lstrip().startswith(b"{"):
-                raise _invalid_sbom(looks_like_cyclonedx, f"{name} is not a JSON object")
+                raise NotAnSbomError(f"{name} is not a JSON object")
+            looks_like_sbom = SBOM_MARKER_RE.search(head) is not None
             raw = head + handle.read()
-        bom = json.loads(raw)
+        document = json.loads(raw)
     except OSError as error:
         raise SbomError(f"{name} cannot be read") from error
     except MemoryError as error:
         raise SbomError(f"{name} is too large to load into memory") from error
     except (ValueError, RecursionError) as error:
-        raise _invalid_sbom(looks_like_cyclonedx, f"{name} is not valid JSON") from error
-    if not isinstance(bom, dict) or bom.get("bomFormat") != "CycloneDX":
-        raise NotAnSbomError(f"{name} is not a CycloneDX SBOM (bomFormat)")
-    spec_version = bom.get("specVersion")
-    if not isinstance(spec_version, str) or not SPEC_VERSION_RE.match(spec_version):
-        raise SbomError(f"{name} has an unsupported CycloneDX specVersion: {clean(spec_version)}")
-    return bom
+        raise _invalid_sbom(looks_like_sbom, f"{name} is not valid JSON") from error
+    if not isinstance(document, dict):
+        raise NotAnSbomError(f"{name} is not a CycloneDX or SPDX SBOM")
+    return Sbom(sbom_format(document, name), document)
 
 
-def _invalid_sbom(looks_like_cyclonedx: bool, message: str) -> SbomError:
-    return SbomError(message) if looks_like_cyclonedx else NotAnSbomError(message)
+def sbom_format(document: dict[str, Any], name: str) -> str:
+    if document.get("bomFormat") == "CycloneDX":
+        spec_version = document.get("specVersion")
+        if not isinstance(spec_version, str) or not SPEC_VERSION_RE.match(spec_version):
+            raise SbomError(f"{name} has an unsupported CycloneDX specVersion: {clean(spec_version)}")
+        return FORMAT_CYCLONEDX
+    if "spdxVersion" in document:
+        spdx_version = document["spdxVersion"]
+        if not isinstance(spdx_version, str) or not SPDX2_VERSION_RE.match(spdx_version):
+            raise SbomError(f"{name} has an unsupported spdxVersion: {clean(spdx_version)}")
+        return FORMAT_SPDX2
+    contexts = _spdx_contexts(document.get("@context"))
+    if contexts:
+        if not any(SPDX3_CONTEXT_RE.match(context) for context in contexts):
+            raise SbomError(f"{name} has an unsupported SPDX @context: {clean(contexts[0])}")
+        return FORMAT_SPDX3
+    raise NotAnSbomError(f"{name} is not a CycloneDX or SPDX SBOM")
+
+
+def _spdx_contexts(context: Any) -> list[str]:
+    """The SPDX URLs in a JSON-LD @context, which may be a single value or a list."""
+    entries = context if isinstance(context, list) else [context]
+    return [entry for entry in entries if isinstance(entry, str) and entry.startswith(SPDX_CONTEXT_PREFIX)]
+
+
+def _invalid_sbom(looks_like_sbom: bool, message: str) -> SbomError:
+    return SbomError(message) if looks_like_sbom else NotAnSbomError(message)
 
 
 def sbom_candidates(directory: Path) -> list[Path]:
@@ -270,9 +312,63 @@ def iter_components(components: Any) -> Iterator[dict[str, Any]]:
 
 def _component_dicts(components: Any) -> list[dict[str, Any]]:
     """Components in reverse order, ready to push onto the stack."""
-    if not isinstance(components, list):
+    return list(reversed(_dicts(components)))
+
+
+def _dicts(value: Any) -> list[dict[str, Any]]:
+    """The objects in a JSON array; anything else in it is ignored."""
+    if not isinstance(value, list):
         return []
-    return [component for component in reversed(components) if isinstance(component, dict)]
+    return [item for item in value if isinstance(item, dict)]
+
+
+# Display name, purl, and version of a component, as found in the SBOM (not validated).
+RawComponent = tuple[Any, Any, Any]
+
+
+def _cyclonedx_components(bom: dict[str, Any]) -> Iterator[RawComponent]:
+    for component in iter_components(bom.get("components")):
+        yield component.get("name") or component.get("bom-ref"), component.get("purl"), component.get("version")
+
+
+def _spdx2_components(document: dict[str, Any]) -> Iterator[RawComponent]:
+    for package in _dicts(document.get("packages")):
+        purl = next(
+            (
+                ref.get("referenceLocator")
+                for ref in _dicts(package.get("externalRefs"))
+                if ref.get("referenceType") == "purl"
+            ),
+            None,
+        )
+        yield package.get("name") or package.get("SPDXID"), purl, package.get("versionInfo")
+
+
+def _spdx3_components(document: dict[str, Any]) -> Iterator[RawComponent]:
+    # A JSON-LD document with a single element may have it at the top level instead of in @graph.
+    elements = _dicts(document.get("@graph")) if "@graph" in document else [document]
+    for element in elements:
+        element_type = element.get("type")
+        if not isinstance(element_type, str) or element_type not in SPDX3_PACKAGE_TYPES:
+            continue
+        purl = element.get("software_packageUrl")
+        if not isinstance(purl, str) or not purl.strip():
+            purl = next(
+                (
+                    identifier.get("identifier")
+                    for identifier in _dicts(element.get("externalIdentifier"))
+                    if identifier.get("externalIdentifierType") == "packageUrl"
+                ),
+                purl,
+            )
+        yield element.get("name") or element.get("spdxId"), purl, element.get("software_packageVersion")
+
+
+_COMPONENT_READERS: dict[str, Callable[[dict[str, Any]], Iterator[RawComponent]]] = {
+    FORMAT_CYCLONEDX: _cyclonedx_components,
+    FORMAT_SPDX2: _spdx2_components,
+    FORMAT_SPDX3: _spdx3_components,
+}
 
 
 @dataclass(frozen=True)
@@ -283,13 +379,12 @@ class SbomScan:
     skipped_components: int
 
 
-def extract_packages(bom: dict[str, Any], source: str) -> SbomScan:
+def extract_packages(sbom: Sbom, source: str) -> SbomScan:
     packages: dict[str, PackageRef] = {}
     skipped = 0
     source = clean(source)
-    for component in iter_components(bom.get("components")):
-        display = clean(component.get("name") or component.get("bom-ref") or "?")
-        purl = component.get("purl")
+    for name, purl, version in _COMPONENT_READERS[sbom.format](sbom.document):
+        display = clean(name or "?")
         if not isinstance(purl, str) or not purl.strip():
             logger.warning("%s: component without a purl: %s", source, display)
             skipped += 1
@@ -303,12 +398,11 @@ def extract_packages(bom: dict[str, Any], source: str) -> SbomScan:
             continue
         query_version = None
         if not parsed.version:
-            component_version = component.get("version")
-            if not isinstance(component_version, str) or not component_version.strip():
+            if not isinstance(version, str) or not version.strip():
                 logger.warning("%s: component without a version, skipped: %s", source, clean(purl))
                 skipped += 1
                 continue
-            query_version = component_version.strip()
+            query_version = version.strip()
         package = PackageRef(purl, parsed, query_version)
         packages.setdefault(package.key, package)
     return SbomScan(source, list(packages.values()), skipped)
@@ -317,9 +411,9 @@ def extract_packages(bom: dict[str, Any], source: str) -> SbomScan:
 @dataclass(frozen=True)
 class Inputs:
     scans: list[SbomScan]
-    # Files that are not CycloneDX JSON SBOMs.
+    # Files that are not CycloneDX or SPDX JSON SBOMs.
     skipped_files: int = 0
-    # Files that may be CycloneDX SBOMs but could not be analyzed.
+    # Files that are or may be SBOMs but could not be analyzed.
     failed_files: tuple[str, ...] = ()
 
 
@@ -339,7 +433,7 @@ def load_directory(directory: Path) -> Inputs:
         except SbomError as error:
             logger.error("cannot analyze: %s", error)
             failed.append(clean(path.name))
-    logger.info("%d CycloneDX SBOMs found, %d files skipped, %d failed", len(scans), skipped, len(failed))
+    logger.info("%d SBOMs found, %d files skipped, %d failed", len(scans), skipped, len(failed))
     return Inputs(scans, skipped, tuple(failed))
 
 
@@ -488,9 +582,7 @@ def query_osv(client: HttpClient, packages: list[PackageRef]) -> dict[PackageRef
         next_pending: list[tuple[PackageRef, str | None]] = []
         for start in range(0, len(pending), OSV_BATCH_SIZE):
             chunk = pending[start : start + OSV_BATCH_SIZE]
-            response = client.post_json(
-                OSV_QUERYBATCH_URL, {"queries": [_osv_query(p, token) for p, token in chunk]}
-            )
+            response = client.post_json(OSV_QUERYBATCH_URL, {"queries": [_osv_query(p, token) for p, token in chunk]})
             results = response.get("results") if isinstance(response, dict) else None
             if not isinstance(results, list) or len(results) != len(chunk):
                 raise ApiError("unexpected response from OSV querybatch")
@@ -525,12 +617,7 @@ def fetch_vuln_details(
         relative = f"osv/{_cache_name(vuln_id)}.json"
         cached = cache.read_json(relative)
         # Without a modified date there is no way to tell whether the copy is current.
-        if (
-            modified
-            and isinstance(cached, dict)
-            and cached.get("id") == vuln_id
-            and cached.get("modified") == modified
-        ):
+        if modified and isinstance(cached, dict) and cached.get("id") == vuln_id and cached.get("modified") == modified:
             return cached
         try:
             data = client.get_json(OSV_VULN_URL.format(urllib.parse.quote(vuln_id, safe="")))
@@ -634,9 +721,7 @@ def cvss2_base_score(vector: str) -> float | None:
     f(Impact) = 0 if Impact == 0 else 1.176
     Base = round_to_1_decimal(((0.6 * Impact) + (0.4 * Exploitability) - 1.5) * f(Impact))
     """
-    text = vector.strip().strip("()")
-    if text.startswith("CVSS:2.0/"):
-        text = text[len("CVSS:2.0/") :]
+    text = vector.strip().strip("()").removeprefix("CVSS:2.0/")
     metrics = _vector_metrics(text.split("/"))
     try:
         c, i, a = (_CVSS2_CIA[metrics[key]] for key in ("C", "I", "A"))
@@ -943,7 +1028,8 @@ def cvss4_score(vector: str) -> float | None:
     # 1.a Maximal scoring difference with the next lower MacroVector of each EQ.
     lower_eq1 = _cvss4_lookup(eq1 + 1, eq2, eq3, eq4, eq5, eq6)
     lower_eq2 = _cvss4_lookup(eq1, eq2 + 1, eq3, eq4, eq5, eq6)
-    if eq3 == 1 and eq6 == 1:
+    # The branches mirror the reference calculator, so they are not combined.
+    if eq3 == 1 and eq6 == 1:  # noqa: SIM114
         lower_eq3eq6 = _cvss4_lookup(eq1, eq2, eq3 + 1, eq4, eq5, eq6)
     elif eq3 == 0 and eq6 == 1:
         lower_eq3eq6 = _cvss4_lookup(eq1, eq2, eq3 + 1, eq4, eq5, eq6)
@@ -971,17 +1057,13 @@ def cvss4_score(vector: str) -> float | None:
     distance: dict[str, float] = {}
     for parts in max_vectors:
         max_vector = _vector_metrics("".join(parts).split("/"))
-        distance = {
-            metric: levels[v(metric)] - levels[max_vector[metric]] for metric, levels in _CVSS4_LEVELS.items()
-        }
+        distance = {metric: levels[v(metric)] - levels[max_vector[metric]] for metric, levels in _CVSS4_LEVELS.items()}
         if all(d >= 0 for d in distance.values()):
             break
 
     current_eq1 = distance["AV"] + distance["PR"] + distance["UI"]
     current_eq2 = distance["AC"] + distance["AT"]
-    current_eq3eq6 = (
-        distance["VC"] + distance["VI"] + distance["VA"] + distance["CR"] + distance["IR"] + distance["AR"]
-    )
+    current_eq3eq6 = distance["VC"] + distance["VI"] + distance["VA"] + distance["CR"] + distance["IR"] + distance["AR"]
     current_eq4 = distance["SC"] + distance["SI"] + distance["SA"]
 
     step = 0.1
@@ -1050,8 +1132,10 @@ def _affected_for(data: dict[str, Any], package: PackageRef) -> list[dict[str, A
                 parsed = parse_purl(osv_purl)
             except ValueError:
                 parsed = None
-            if parsed and parsed.type == package.parsed.type and package.matches(
-                f"{parsed.namespace}/{parsed.name}" if parsed.namespace else parsed.name
+            if (
+                parsed
+                and parsed.type == package.parsed.type
+                and package.matches(f"{parsed.namespace}/{parsed.name}" if parsed.namespace else parsed.name)
             ):
                 matching.append(entry)
                 continue
@@ -1554,7 +1638,7 @@ def print_reports(reports: list[Report], inputs: Inputs, directory_mode: bool) -
         print()
     findings = [finding for report in reports for finding in report.findings]
     print(
-        f"SBOMs analyzed: {len(reports)}. Files skipped (not a CycloneDX JSON SBOM): {inputs.skipped_files}."
+        f"SBOMs analyzed: {len(reports)}. Files skipped (not a CycloneDX or SPDX JSON SBOM): {inputs.skipped_files}."
         f" SBOMs that could not be analyzed: {len(inputs.failed_files)}."
     )
     if inputs.failed_files:
@@ -1587,15 +1671,15 @@ def write_reports(output_dir: Path, reports: list[Report], generated_at: str) ->
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Looks up known vulnerabilities (OSV + CISA KEV + EPSS) in CycloneDX JSON SBOMs.",
+        description="Looks up known vulnerabilities (OSV + CISA KEV + EPSS) in CycloneDX and SPDX JSON SBOMs.",
     )
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("sbom", nargs="?", type=Path, help="CycloneDX JSON SBOM file")
+    source.add_argument("sbom", nargs="?", type=Path, help="CycloneDX or SPDX JSON SBOM file")
     source.add_argument(
         "--input-dir",
         type=Path,
         metavar="DIR",
-        help="analyze every CycloneDX JSON SBOM directly inside DIR (subdirectories are not read;"
+        help="analyze every CycloneDX or SPDX JSON SBOM directly inside DIR (subdirectories are not read;"
         " other files are skipped)",
     )
     parser.add_argument(
@@ -1606,8 +1690,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--fail-on",
         type=_fail_on_priority,
         metavar="PRIORITY",
-        help=f"exit with code {EXIT_FAIL_ON} if any finding has this priority or higher"
-        f" ({', '.join(FAIL_ON_CHOICES)})",
+        help=f"exit with code {EXIT_FAIL_ON} if any finding has this priority or higher ({', '.join(FAIL_ON_CHOICES)})",
     )
     parser.add_argument(
         "--cache-dir", type=Path, default=Path(".cache"), help="cache directory for OSV details (default: .cache)"
