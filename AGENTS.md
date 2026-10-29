@@ -1,6 +1,6 @@
 # Agent Guidelines
 
-sbom-triage is a command-line tool (`sbom_triage.py`) that reads CycloneDX JSON SBOMs (a single file or every SBOM in a directory), looks up known vulnerabilities in OSV, enriches them with CISA KEV and EPSS, and prioritizes them. It is meant to support other tools.
+sbom-triage is a command-line tool (`sbom_triage.py`) that reads CycloneDX and SPDX JSON SBOMs (a single file or every SBOM in a directory), looks up known vulnerabilities in OSV, enriches them with CISA KEV and EPSS, and prioritizes them. It is meant to support other tools.
 
 The tool only generates results. It does not store them or compare runs; that belongs to whatever system consumes its JSON output. Do not add persistence of results.
 
@@ -43,7 +43,7 @@ The tool only generates results. It does not store them or compare runs; that be
 - Never hardcode secrets, tokens, or credentials. The current APIs need none; if one is ever added, read it from the environment and never log it.
 - Do not use `eval`, `exec`, `pickle`, or `shell=True`.
 - Write files (cache, JSON reports) atomically, only inside the paths the user chose or the cache directory. Output file names are derived from input file names, never from SBOM content.
-- Results must never be silently incomplete. A failing data source is an error (exit code 1); do not fall back to stored data. In directory mode, a file that may be a CycloneDX SBOM but cannot be analyzed is an error (`SbomError`, exit code 4), while a file that is not a CycloneDX SBOM is skipped (`NotAnSbomError`). The only data left out with just a warning is an OSV record that no longer exists (HTTP 404), because there is nothing to report.
+- Results must never be silently incomplete. A failing data source is an error (exit code 1); do not fall back to stored data. In directory mode, a file that is or may be a CycloneDX or SPDX SBOM but cannot be analyzed (including an unsupported version) is an error (`SbomError`, exit code 4), while a file that is not a CycloneDX or SPDX JSON SBOM is skipped (`NotAnSbomError`). The only data left out with just a warning is an OSV record that no longer exists (HTTP 404), because there is nothing to report.
 - Apply the principle of least privilege. The tool needs no administrator rights.
 - Do not disable security mechanisms (such as TLS verification) to work around development problems.
 - When a requested implementation conflicts with a security best practice, prefer the secure implementation and clearly explain the trade-off.
